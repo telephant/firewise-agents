@@ -13,7 +13,7 @@ import logging
 from typing import List, Dict, Any, TypedDict, Optional, Annotated
 import operator
 
-from langchain.globals import set_debug
+from langchain_core.globals import set_debug
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import (
     BaseMessage,

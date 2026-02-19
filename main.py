@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from routes import runway_router, import_router
+from routes import runway_router, import_router, chat_router
 
 
 # Configure logging
@@ -35,6 +35,7 @@ app.add_middleware(
 # Include routes
 app.include_router(runway_router, prefix="/runway", tags=["runway"])
 app.include_router(import_router, prefix="/import", tags=["import"])
+app.include_router(chat_router, prefix="/chat", tags=["chat"])
 
 
 @app.get("/health")
@@ -56,7 +57,8 @@ async def root():
         "endpoints": {
             "runway": "POST /runway",
             "import": "POST /import",
-            "health": "GET /health"
+            "chat": "POST /chat",
+            "health": "GET /health",
         }
     }
 

@@ -3,7 +3,7 @@ import io
 import json
 import re
 import logging
-from typing import Optional
+from typing import Optional, List
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -13,6 +13,9 @@ from schemas.import_schema import ImportRequest, ImportResponse, ExtractedAsset,
 
 
 logger = logging.getLogger(__name__)
+
+# Maximum characters per chunk to stay within token limits
+MAX_CHUNK_SIZE = 4096
 
 
 IMPORT_SYSTEM_PROMPT = """You are a financial document parser specializing in brokerage statements.
@@ -160,6 +163,64 @@ def extract_text(file_content: str, file_type: str, file_name: Optional[str] = N
         raise ValueError(f"Unsupported file type: {file_type}")
 
 
+def split_text_into_chunks(text: str, max_size: int = MAX_CHUNK_SIZE) -> List[str]:
+    """
+    Split text into chunks of max_size by reading line by line.
+
+    This ensures we never cut in the middle of a line, which is important
+    for preserving table rows and data integrity.
+
+    Args:
+        text: The text to split
+        max_size: Maximum characters per chunk (default 4096)
+
+    Returns:
+        List of text chunks
+    """
+    if len(text) <= max_size:
+        return [text]
+
+    chunks = []
+    lines = text.split('\n')
+
+    current_chunk_lines = []
+    current_chunk_size = 0
+
+    for line in lines:
+        line_with_newline = line + '\n'
+        line_size = len(line_with_newline)
+
+        # If single line exceeds max_size, we have to include it anyway
+        # (better to have one oversized chunk than lose data)
+        if line_size > max_size:
+            # Save current chunk first if it has content
+            if current_chunk_lines:
+                chunks.append('\n'.join(current_chunk_lines))
+                current_chunk_lines = []
+                current_chunk_size = 0
+            # Add the oversized line as its own chunk
+            chunks.append(line)
+            continue
+
+        # Check if adding this line would exceed max_size
+        if current_chunk_size + line_size > max_size:
+            # Save current chunk and start a new one
+            if current_chunk_lines:
+                chunks.append('\n'.join(current_chunk_lines))
+            current_chunk_lines = [line]
+            current_chunk_size = line_size
+        else:
+            # Add line to current chunk
+            current_chunk_lines.append(line)
+            current_chunk_size += line_size
+
+    # Don't forget the last chunk
+    if current_chunk_lines:
+        chunks.append('\n'.join(current_chunk_lines))
+
+    return chunks
+
+
 def extract_json_from_response(text: str) -> dict:
     """Extract JSON from LLM response, handling various formats."""
     # Try direct JSON parse first
@@ -187,9 +248,93 @@ def extract_json_from_response(text: str) -> dict:
     raise ValueError(f"Could not parse JSON from response: {text[:500]}...")
 
 
+async def analyze_chunk(llm, prompt, chunk_text: str, chunk_index: int, total_chunks: int) -> dict:
+    """
+    Analyze a single text chunk and return parsed results.
+
+    Args:
+        llm: The LLM instance
+        prompt: The prompt template
+        chunk_text: The text chunk to analyze
+        chunk_index: Index of this chunk (0-based)
+        total_chunks: Total number of chunks
+
+    Returns:
+        Parsed JSON dict with assets, source_info, warnings, confidence
+    """
+    chain = prompt | llm
+
+    context_note = ""
+    if total_chunks > 1:
+        context_note = f"\n\n[This is chunk {chunk_index + 1} of {total_chunks}. Extract all assets found in this section.]"
+
+    result = await chain.ainvoke({"document": chunk_text + context_note})
+    return extract_json_from_response(result.content)
+
+
+def merge_chunk_results(chunk_results: List[dict]) -> dict:
+    """
+    Merge results from multiple chunks into a single result.
+
+    Args:
+        chunk_results: List of parsed results from each chunk
+
+    Returns:
+        Merged result dict
+    """
+    all_assets = []
+    all_warnings = []
+    source_info = {}
+    confidences = []
+
+    # Track seen tickers to avoid duplicates
+    seen_tickers = set()
+
+    for result in chunk_results:
+        # Merge assets (deduplicate by ticker)
+        for asset in result.get("assets", []):
+            ticker = asset.get("ticker")
+            if ticker:
+                ticker_key = ticker.upper()
+                if ticker_key in seen_tickers:
+                    # Skip duplicate ticker, but keep the one with higher confidence
+                    continue
+                seen_tickers.add(ticker_key)
+            all_assets.append(asset)
+
+        # Collect warnings
+        all_warnings.extend(result.get("warnings", []))
+
+        # Keep first non-empty source_info
+        chunk_source = result.get("source_info", {})
+        if chunk_source and not source_info:
+            source_info = chunk_source
+        elif chunk_source:
+            # Merge source_info fields if current is incomplete
+            for key, value in chunk_source.items():
+                if value and not source_info.get(key):
+                    source_info[key] = value
+
+        # Collect confidence scores
+        if "confidence" in result:
+            confidences.append(result["confidence"])
+
+    # Calculate average confidence
+    avg_confidence = sum(confidences) / len(confidences) if confidences else 0.8
+
+    return {
+        "assets": all_assets,
+        "source_info": source_info,
+        "warnings": list(set(all_warnings)),  # Deduplicate warnings
+        "confidence": avg_confidence
+    }
+
+
 async def analyze_import(request: ImportRequest) -> ImportResponse:
     """
     Analyze a brokerage statement and extract asset holdings.
+
+    Splits large documents into chunks to avoid token limits.
 
     Args:
         request: ImportRequest with base64 file content and file type
@@ -220,14 +365,11 @@ async def analyze_import(request: ImportRequest) -> ImportResponse:
             confidence=0.0
         )
 
-    # Truncate if too long (keep first 15000 chars to stay within token limits)
-    max_chars = 15000
-    truncated = False
-    if len(document_text) > max_chars:
-        document_text = document_text[:max_chars]
-        truncated = True
+    # Split text into chunks to stay within token limits
+    chunks = split_text_into_chunks(document_text, MAX_CHUNK_SIZE)
+    logger.info(f"Document split into {len(chunks)} chunks (total chars: {len(document_text)})")
 
-    # Create LLM chain
+    # Create LLM
     llm = ChatOpenAI(
         model=settings.model_name,
         openai_api_base=settings.openai_api_base,
@@ -240,23 +382,35 @@ async def analyze_import(request: ImportRequest) -> ImportResponse:
         ("human", "Document content:\n\n{document}\n\nExtract all asset holdings. Return JSON only."),
     ])
 
-    chain = prompt | llm
-
     try:
-        result = await chain.ainvoke({"document": document_text})
-        parsed = extract_json_from_response(result.content)
+        # Analyze each chunk
+        chunk_results = []
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Analyzing chunk {i + 1}/{len(chunks)} ({len(chunk)} chars)")
+            try:
+                result = await analyze_chunk(llm, prompt, chunk, i, len(chunks))
+                chunk_results.append(result)
+            except Exception as e:
+                logger.warning(f"Failed to analyze chunk {i + 1}: {e}")
+                chunk_results.append({
+                    "assets": [],
+                    "warnings": [f"Failed to analyze part {i + 1} of document"],
+                    "confidence": 0.0
+                })
+
+        # Merge results from all chunks
+        merged = merge_chunk_results(chunk_results)
 
         # Build response
         response = ImportResponse(
-            assets=[ExtractedAsset(**a) for a in parsed.get("assets", [])],
-            source_info=SourceInfo(**parsed.get("source_info", {})),
-            warnings=parsed.get("warnings", []),
-            confidence=parsed.get("confidence", 0.8)
+            assets=[ExtractedAsset(**a) for a in merged.get("assets", [])],
+            source_info=SourceInfo(**merged.get("source_info", {})),
+            warnings=merged.get("warnings", []),
+            confidence=merged.get("confidence", 0.8)
         )
 
-        if truncated:
-            response.warnings.append("Document was truncated due to size. Some assets may be missing.")
-            response.confidence = min(response.confidence, 0.7)
+        if len(chunks) > 1:
+            response.warnings.append(f"Document was processed in {len(chunks)} parts.")
 
         return response
 
